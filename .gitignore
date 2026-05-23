@@ -1,6 +1,43 @@
+# Dependencies
 node_modules/
+
+# npm / package manager output
 npm-debug.log*
-.DS_Store
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 *.tgz
+
+# Local env and registry credentials
+.env
+.env.*
+.npmrc
+
+# Local CLI/runtime state
 .itp/
 .codex/
+credentials.json
+voltagent.env
+
+# Secrets and keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Build/test artifacts
+dist/
+build/
+coverage/
+.nyc_output/
+tmp/
+temp/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
