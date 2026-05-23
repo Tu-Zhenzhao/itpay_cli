@@ -1,0 +1,1186 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
+
+const VERSION = "0.1.0";
+const DEFAULT_API_BASE = process.env.VOLTAGENT_API_BASE || "http://localhost:3000";
+const CONFIG_DIR = path.join(os.homedir(), ".itp");
+const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const STATE_PATH = path.join(CONFIG_DIR, "state.json");
+const CREDENTIALS_PATH = path.join(CONFIG_DIR, "credentials.json");
+
+main().catch((error) => {
+  outputError(error);
+  process.exit(1);
+});
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes("--version") || args[0] === "version") {
+    output({ version: VERSION });
+    return;
+  }
+
+  const [group, command, ...rest] = args;
+  const flags = parseFlags(rest);
+
+  if (group === "usage") {
+    await usage(parseFlags(args.slice(1)));
+    return;
+  }
+  if (group === "balance") {
+    await balance(parseFlags(args.slice(1)));
+    return;
+  }
+  if (group === "plans" && (!command || String(command).startsWith("--"))) {
+    await plansList(parseFlags(args.slice(1)));
+    return;
+  }
+  if (group === "doctor") {
+    await doctor(parseFlags(args.slice(1)));
+    return;
+  }
+  if (group === "keys") {
+    await keys(command, parseFlags(rest));
+    return;
+  }
+  if (group === "token") {
+    await token(command, parseFlags(rest));
+    return;
+  }
+  if (group === "sync") {
+    await sync(parseFlags(args.slice(1)));
+    return;
+  }
+  if (group === "admin") {
+    await admin(command, rest, parseFlags(rest));
+    return;
+  }
+
+  switch (`${group || ""} ${command || ""}`.trim()) {
+    case "auth register":
+      await authRegister(flags);
+      return;
+    case "auth login":
+      await authLogin(flags);
+      return;
+    case "auth status":
+      await authStatus(flags);
+      return;
+    case "account show":
+      await accountShow(flags);
+      return;
+    case "account login-link":
+      await accountLoginLink(flags);
+      return;
+    case "account set-password":
+      await accountSetPassword(flags);
+      return;
+    case "plans list":
+      await plansList(flags);
+      return;
+    case "plans show":
+      await plansShow(rest[0], flags);
+      return;
+    case "checkout create":
+      await checkoutCreate(flags);
+      return;
+    case "checkout recover":
+      await checkoutRecover(rest[0] || readState().last_checkout_id, flags);
+      return;
+    case "checkout open":
+      await checkoutOpen(flags);
+      return;
+    case "checkout qr":
+      await checkoutQR(rest[0] || readState().last_checkout_id, flags);
+      return;
+    case "checkout list":
+      await checkoutList(flags);
+      return;
+    case "payment wait":
+      await paymentWait(rest[0] || readState().last_checkout_id, flags);
+      return;
+    case "balance":
+      await balance(flags);
+      return;
+    case "grants list":
+      await grantsList(flags);
+      return;
+    case "grants show":
+      await grantsShow(rest[0], flags);
+      return;
+    case "grants install":
+      await grantsInstall(rest[0], flags);
+      return;
+    case "grants revoke":
+      await grantsRevoke(rest[0], flags);
+      return;
+    case "install claude-code":
+    case "install codex":
+    case "install openclaw":
+      await installRuntime(command, flags);
+      return;
+    case "doctor":
+      await doctor(flags);
+      return;
+    default:
+      output({
+        version: VERSION,
+        commands: [
+          "auth register",
+          "auth login",
+          "auth status",
+          "account show",
+          "account login-link",
+          "account set-password --password-stdin",
+          "plans list",
+          "plans show <plan>",
+          "checkout create --plan coding-100 --method alipay",
+          "checkout create --plan coding-100 --idempotency-key <uuid>",
+          "checkout qr <checkout_id>",
+          "checkout open",
+          "checkout recover <checkout_id>",
+          "checkout list --limit 20",
+          "payment wait <checkout_id> --timeout 120",
+          "balance",
+          "usage --today --model <model>",
+          "grants list",
+          "grants show <grant_id>",
+          "grants install <grant_id> --target codex",
+          "grants revoke <grant_id>",
+          "keys list",
+          "keys rotate --grant <grant_id>",
+          "keys revoke --grant <grant_id>",
+          "token issue --grant <grant_id> --stdout",
+          "sync",
+          "admin orders --access-token <root_token> --new-api-user <id>",
+          "admin payment-events --access-token <root_token> --new-api-user <id>",
+          "admin outbox --access-token <root_token> --new-api-user <id>",
+          "admin process-outbox --access-token <root_token> --new-api-user <id>",
+          "admin recover-order <order_id> --access-token <root_token> --new-api-user <id>",
+          "install claude-code|codex|openclaw --grant <grant_id> [--offline|--no-test]",
+          "doctor"
+        ]
+      });
+  }
+}
+
+async function authRegister(flags) {
+  const runtime = flags.runtime || "unknown";
+  const response = await api("/api/itp/auth/register", {
+    method: "POST",
+    body: {
+      username: flags.username || undefined,
+      email: flags.email || undefined,
+      device: {
+        display_name: os.hostname(),
+        runtime,
+        os: os.platform(),
+        arch: os.arch(),
+        itp_version: VERSION
+      }
+    }
+  }, flags);
+  writeSessionCredentials(response);
+  writeConfig({
+    api_base: apiBase(flags),
+    account_id: response.account_id,
+    device_id: response.device_id,
+    web_console_url: response.web_console_url
+  });
+  output(sanitizeAuthResponse(response));
+}
+
+async function authLogin(flags) {
+  const runtime = flags.runtime || "unknown";
+  if (flags.password && !flags.password_stdin) {
+    throw new Error("use --password-stdin to avoid leaking passwords into shell history");
+  }
+  const password = flags.password_stdin
+    ? fs.readFileSync(0, "utf8").trim()
+    : undefined;
+  if (flags.password_stdin && !password) {
+    throw new Error("password is required on stdin");
+  }
+  const response = await api("/api/itp/auth/login", {
+    method: "POST",
+    body: {
+      username: flags.username || undefined,
+      password,
+      access_token: flags.access_token || undefined,
+      device: {
+        display_name: os.hostname(),
+        runtime,
+        os: os.platform(),
+        arch: os.arch(),
+        itp_version: VERSION
+      }
+    }
+  }, flags);
+  writeSessionCredentials(response);
+  writeConfig({
+    api_base: apiBase(flags),
+    account_id: response.account_id,
+    device_id: response.device_id,
+    web_console_url: response.web_console_url
+  });
+  output(sanitizeAuthResponse(response));
+}
+
+async function authStatus(flags) {
+  const config = readConfig();
+  const credentials = readCredentials();
+  if (!readSessionToken(credentials)) {
+    output({ authenticated: false, account_id: config.account_id || null });
+    return;
+  }
+  try {
+    const status = await api("/api/itp/auth/status", { method: "GET" }, flags);
+    output(status);
+  } catch (error) {
+    output({
+      authenticated: false,
+      account_id: config.account_id || null,
+      error: error.message
+    });
+  }
+}
+
+async function accountShow(flags) {
+  output(await api("/api/itp/account", { method: "GET" }, flags));
+}
+
+async function accountLoginLink(flags) {
+  output(await api("/api/itp/account/login-link", { method: "POST" }, flags));
+}
+
+async function accountSetPassword(flags) {
+  if (!flags.password_stdin) {
+    throw new Error("use --password-stdin to avoid leaking passwords into shell history");
+  }
+  const password = fs.readFileSync(0, "utf8").trim();
+  if (!password) throw new Error("password is required on stdin");
+  output(await api("/api/itp/account/password", {
+    method: "POST",
+    body: { password }
+  }, flags));
+}
+
+async function plansList(flags) {
+  output(await api("/api/itp/plans", { method: "GET" }, flags));
+}
+
+async function plansShow(plan, flags) {
+  if (!plan) throw new Error("plan id is required");
+  output(await api(`/api/itp/plans/${encodeURIComponent(plan)}`, { method: "GET" }, flags));
+}
+
+async function checkoutCreate(flags) {
+  const plan = flags.plan || "coding-100";
+  const method = flags.method || "alipay";
+  const idempotencyKey = flags.idempotency_key || cryptoRandom();
+  const response = await api("/api/itp/checkout", {
+    method: "POST",
+    body: {
+      plan_id: plan,
+      payment_method: method,
+      idempotency_key: idempotencyKey
+    }
+  }, flags);
+  writeState({ ...readState(), last_checkout_id: response.checkout_id, last_grant_id: response.grant_id || null });
+  output(response);
+}
+
+async function paymentWait(checkoutId, flags) {
+  if (!checkoutId) throw new Error("checkout_id is required");
+  const started = Date.now();
+  const timeoutMs = Number(flags.timeout || 120) * 1000;
+  let lastRecoverAt = 0;
+  let lastResponse = null;
+  while (Date.now() - started < timeoutMs) {
+    let response = await api(`/api/itp/checkout/${encodeURIComponent(checkoutId)}`, { method: "GET" }, flags);
+    lastResponse = response;
+    if (isTerminalCheckoutFailure(response.status)) {
+      throw new Error(`checkout ended with status: ${response.status}`);
+    }
+    if (isSuccessfulCheckout(response)) {
+      writeState({ ...readState(), last_checkout_id: checkoutId, last_grant_id: response.grant_id });
+      output({ status: "grant_issued", checkout_id: checkoutId, order_id: response.order_id, grant_id: response.grant_id });
+      return;
+    }
+    if (shouldRecoverCheckout(response.status) && Date.now() - lastRecoverAt > 5000) {
+      lastRecoverAt = Date.now();
+      response = await api(`/api/itp/checkout/${encodeURIComponent(checkoutId)}/recover`, { method: "POST" }, flags);
+      lastResponse = response;
+      if (isTerminalCheckoutFailure(response.status)) {
+        throw new Error(`checkout ended with status: ${response.status}`);
+      }
+      if (isSuccessfulCheckout(response)) {
+        writeState({ ...readState(), last_checkout_id: checkoutId, last_grant_id: response.grant_id });
+        output({ status: "grant_issued", checkout_id: checkoutId, order_id: response.order_id, grant_id: response.grant_id, recovered: true });
+        return;
+      }
+    }
+    await sleep(2000);
+  }
+  try {
+    const response = await api(`/api/itp/checkout/${encodeURIComponent(checkoutId)}/recover`, { method: "POST" }, flags);
+    lastResponse = response;
+    if (isTerminalCheckoutFailure(response.status)) {
+      throw new Error(`checkout ended with status: ${response.status}`);
+    }
+    if (isSuccessfulCheckout(response)) {
+      writeState({ ...readState(), last_checkout_id: checkoutId, last_grant_id: response.grant_id });
+      output({ status: "grant_issued", checkout_id: checkoutId, order_id: response.order_id, grant_id: response.grant_id, recovered: true });
+      return;
+    }
+  } catch (error) {
+    if (isTerminalCheckoutFailure(lastResponse?.status)) {
+      throw error;
+    }
+    // Preserve the timeout message below; recover is a best-effort final attempt.
+  }
+  if (lastResponse?.status) {
+    throw new Error(`payment wait timed out at checkout status ${lastResponse.status}; run \`itp checkout recover ${checkoutId}\` later`);
+  }
+  throw new Error("payment wait timed out; run `itp checkout recover` later");
+}
+
+async function checkoutRecover(checkoutId, flags) {
+  if (!checkoutId) throw new Error("checkout_id is required");
+  const response = await api(`/api/itp/checkout/${encodeURIComponent(checkoutId)}/recover`, { method: "POST" }, flags);
+  if (response.grant_id) {
+    writeState({ ...readState(), last_checkout_id: checkoutId, last_grant_id: response.grant_id });
+  }
+  output(response);
+}
+
+async function checkoutOpen(flags) {
+  const state = readState();
+  if (!state.last_checkout_id) throw new Error("no checkout found in local state");
+  const response = await api(`/api/itp/checkout/${encodeURIComponent(state.last_checkout_id)}`, { method: "GET" }, flags);
+  output(response.payment || response);
+}
+
+async function checkoutQR(checkoutId, flags) {
+  if (!checkoutId) throw new Error("checkout_id is required");
+  output(await api(`/api/itp/checkout/${encodeURIComponent(checkoutId)}/qr`, { method: "GET" }, flags));
+}
+
+async function checkoutList(flags) {
+  const params = new URLSearchParams();
+  if (flags.limit) params.set("limit", flags.limit);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  output(await api(`/api/itp/orders${suffix}`, { method: "GET" }, flags));
+}
+
+async function balance(flags) {
+  output(await api("/api/itp/balance", { method: "GET" }, flags));
+}
+
+async function usage(flags) {
+  const params = new URLSearchParams();
+  if (flags.model) params.set("model", flags.model);
+  if (flags.grant) params.set("grant_id", flags.grant);
+  if (flags.grant_id) params.set("grant_id", flags.grant_id);
+  if (flags.from) params.set("from", flags.from);
+  if (flags.to) params.set("to", flags.to);
+  if (flags.today) {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    params.set("from", Math.floor(start.getTime() / 1000).toString());
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  output(await api(`/api/itp/usage${suffix}`, { method: "GET" }, flags));
+}
+
+async function grantsList(flags) {
+  output(await api("/api/itp/grants", { method: "GET" }, flags));
+}
+
+async function grantsShow(grantId, flags) {
+  if (!grantId) throw new Error("grant_id is required");
+  output(await api(`/api/itp/grants/${encodeURIComponent(grantId)}`, { method: "GET" }, flags));
+}
+
+async function grantsInstall(grantId, flags) {
+  grantId = grantId || readState().last_grant_id;
+  if (!grantId) throw new Error("grant_id is required");
+  const target = flags.target || "codex";
+  const response = await api(`/api/itp/grants/${encodeURIComponent(grantId)}/install`, {
+    method: "POST",
+    body: { target }
+  }, flags);
+  const storedCredential = storeGrantCredential(grantId, {
+    key: response.credential.key_once,
+    target,
+    base_url: response.base_url,
+    openai_base_url: response.openai_base_url,
+    anthropic_base_url: response.anthropic_base_url,
+    gemini_base_url: response.gemini_base_url,
+    models: response.models || [],
+    install_profiles: response.install_profiles || []
+  });
+  const grantsDir = path.join(CONFIG_DIR, "grants");
+  ensureConfigDir();
+  fs.mkdirSync(grantsDir, { recursive: true });
+  try {
+    fs.chmodSync(grantsDir, 0o700);
+  } catch {
+    // Best effort; grant metadata does not contain gateway keys.
+  }
+  const metadataPath = path.join(grantsDir, `${grantId}.json`);
+  fs.writeFileSync(metadataPath, JSON.stringify({
+    grant_id: grantId,
+    target,
+    base_url: response.base_url,
+    models: response.models,
+    install_profiles: response.install_profiles
+  }, null, 2), { mode: 0o600 });
+  fs.chmodSync(metadataPath, 0o600);
+  writeState({ ...readState(), last_grant_id: grantId });
+  output({
+    ...response,
+    credential: {
+      type: response.credential.type,
+      stored: true,
+      credential_store: storedCredential.credential_store,
+      warning: storedCredential.credential_warning || undefined
+    }
+  });
+}
+
+async function grantsRevoke(grantId, flags) {
+  grantId = grantId || flags.grant || readState().last_grant_id;
+  if (!grantId) throw new Error("grant_id is required");
+  const response = await api(`/api/itp/grants/${encodeURIComponent(grantId)}/revoke`, { method: "POST" }, flags);
+  deleteGrantCredential(grantId);
+  const state = readState();
+  if (state.last_grant_id === grantId) {
+    delete state.last_grant_id;
+    writeState(state);
+  }
+  output(response);
+}
+
+async function installRuntime(target, flags) {
+  const grantId = flags.grant || readState().last_grant_id;
+  if (!grantId) throw new Error("grant id is required");
+  const credentials = readGrantCredential(grantId);
+  if (!credentials) throw new Error(`grant ${grantId} is not installed; run grants install first`);
+  if (!credentials.key) {
+    throw new Error(`grant ${grantId} credential key is unavailable; run keys rotate or grants install again`);
+  }
+
+  const dryRun = Boolean(flags.dry_run);
+  const result = installTargetConfig(target, grantId, credentials, dryRun);
+  const shouldTest = !dryRun && !flags.offline && !flags.no_test;
+  const modelCheck = shouldTest
+    ? await doctorModelCheck(target, credentials)
+    : { attempted: false, skipped: true, reason: dryRun ? "dry_run" : flags.offline ? "offline" : "no_test" };
+  result.model_check = modelCheck;
+  result.tested = Boolean(modelCheck.ok);
+  if (modelCheck.attempted && !modelCheck.ok) {
+    result.warnings.push(`Model endpoint check failed: ${modelCheck.error || modelCheck.status || "unknown error"}`);
+  }
+
+  if (!dryRun && !flags.offline) {
+    await api(`/api/itp/grants/${encodeURIComponent(grantId)}/install-ack`, {
+      method: "POST",
+      body: {
+        target,
+        status: "installed",
+        tested: result.tested,
+        config_path: result.files[0]?.path || "",
+        last_error: result.warnings.join("; ")
+      }
+    }, flags);
+  }
+  output(result);
+}
+
+function shouldRecoverCheckout(status) {
+  return ["paid_verified", "granting", "grant_failed"].includes(status);
+}
+
+function isSuccessfulCheckout(response) {
+  return Boolean(response?.grant_id) && ["grant_issued", "grant_installed"].includes(response.status);
+}
+
+function isTerminalCheckoutFailure(status) {
+  return ["expired", "payment_failed", "verify_failed", "amount_mismatch", "revoked"].includes(status);
+}
+
+function installTargetConfig(target, grantId, credentials, dryRun) {
+  if (target === "codex") return installCodex(grantId, credentials, dryRun);
+  if (target === "claude-code") return installClaudeCode(grantId, credentials, dryRun);
+  if (target === "openclaw") return installOpenClaw(grantId, credentials, dryRun);
+  throw new Error(`unsupported install target: ${target}`);
+}
+
+function installClaudeCode(grantId, credentials, dryRun) {
+  const settingsPath = path.join(os.homedir(), ".claude", "settings.json");
+  const current = readJSON(settingsPath, {});
+  current.env = {
+    ...(current.env || {}),
+    ANTHROPIC_BASE_URL: credentials.anthropic_base_url,
+    ANTHROPIC_AUTH_TOKEN_HELPER: `${quoteShell(currentExecutable())} token issue --grant ${quoteShell(grantId)} --stdout`
+  };
+  delete current.env.ANTHROPIC_API_KEY;
+  const write = writeJSONWithBackup(settingsPath, current, dryRun);
+  return {
+    target: "claude-code",
+    grant_id: grantId,
+    status: dryRun ? "dry_run" : "installed",
+    files: [{ path: settingsPath, action: write.action, backup_path: write.backup_path || null }],
+    warnings: [
+      "Claude Code will call itp as an auth token helper; no gateway key was written to settings.json."
+    ]
+  };
+}
+
+function installCodex(grantId, credentials, dryRun) {
+  const configPath = path.join(os.homedir(), ".codex", "config.toml");
+  const envPath = path.join(CONFIG_DIR, "voltagent.env");
+  const existing = readText(configPath, "");
+  const block = [
+    'model_provider = "voltagent"',
+    'model = "openai-code-default"',
+    "",
+    "[model_providers.voltagent]",
+    'name = "VoltaGent"',
+    `base_url = "${escapeTomlString(credentials.openai_base_url)}"`,
+    'env_key = "VOLTAGENT_API_KEY"'
+  ].join("\n");
+  const nextConfig = replaceManagedBlock(existing, "voltagent", block);
+  const configWrite = writeTextWithBackup(configPath, nextConfig, 0o600, dryRun);
+  const envWrite = writeTextWithBackup(envPath, `export VOLTAGENT_API_KEY=${quoteShell(credentials.key)}\n`, 0o600, dryRun);
+  return {
+    target: "codex",
+    grant_id: grantId,
+    status: dryRun ? "dry_run" : "installed",
+    files: [
+      { path: configPath, action: configWrite.action, backup_path: configWrite.backup_path || null },
+      { path: envPath, action: envWrite.action, backup_path: envWrite.backup_path || null }
+    ],
+    warnings: [
+      "Codex reads VOLTAGENT_API_KEY from its process environment; source ~/.itp/voltagent.env before starting Codex if your launcher does not load it."
+    ]
+  };
+}
+
+function installOpenClaw(grantId, credentials, dryRun) {
+  const configPath = path.join(os.homedir(), ".openclaw", "config.json");
+  const current = readJSON(configPath, {});
+  current.models = current.models || {};
+  current.models.providers = current.models.providers || {};
+  current.models.providers.voltagent = {
+    baseUrl: credentials.openai_base_url,
+    api: "openai-compatible",
+    apiKey: credentials.key,
+    models: credentials.models || []
+  };
+  const write = writeJSONWithBackup(configPath, current, dryRun);
+  return {
+    target: "openclaw",
+    grant_id: grantId,
+    status: dryRun ? "dry_run" : "installed",
+    files: [{ path: configPath, action: write.action, backup_path: write.backup_path || null }],
+    warnings: [
+      "OpenClaw does not expose a stable token-helper contract here, so the key is written only to the user-level config file with 0600 permissions."
+    ]
+  };
+}
+
+async function doctor(flags) {
+  const config = readConfig();
+  const credentials = readCredentials();
+  const target = flags.target || null;
+  const grantId = flags.grant || readState().last_grant_id || null;
+  const grantCredential = grantId ? readGrantCredential(grantId) : null;
+  output({
+    itp_version: VERSION,
+    api_base: config.api_base || apiBase(flags),
+    account_id: config.account_id || null,
+    device_id: config.device_id || null,
+    authenticated: Boolean(readSessionToken(credentials)),
+    grants_cached: Object.keys(credentials).filter((k) => k.startsWith("grant_")).length,
+    grant_id: grantId,
+    target,
+    target_config: target ? runtimeConfigStatus(target) : null,
+    model_check: grantCredential && !flags.offline ? await doctorModelCheck(target, grantCredential) : null,
+    grant_credential_store: grantCredential?.credential_store || null,
+    warning: grantCredential?.credential_warning || undefined,
+    credential_store: {
+      path: CREDENTIALS_PATH,
+      mode: fileMode(CREDENTIALS_PATH),
+      native: detectNativeCredentialStore(),
+      fallback: true
+    },
+    session_credential_store: credentials.session_token_store || (credentials.session_token ? "file" : null),
+    session_credential_warning: credentials.session_token_warning || undefined
+  });
+}
+
+async function doctorModelCheck(target, credentials) {
+  const baseUrl = target === "claude-code"
+    ? credentials.anthropic_base_url
+    : target === "codex" || target === "openclaw"
+      ? credentials.openai_base_url
+      : credentials.openai_base_url || credentials.base_url;
+  if (!baseUrl || !credentials.key) {
+    return { attempted: false, ok: false, error: "missing base_url or credential" };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${credentials.key}` },
+      signal: controller.signal
+    });
+    return {
+      attempted: true,
+      ok: response.ok,
+      status: response.status,
+      endpoint: `${baseUrl.replace(/\/$/, "")}/models`
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      ok: false,
+      endpoint: `${baseUrl.replace(/\/$/, "")}/models`,
+      error: error.message
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function runtimeConfigStatus(target) {
+  const paths = {
+    "claude-code": [path.join(os.homedir(), ".claude", "settings.json")],
+    codex: [path.join(os.homedir(), ".codex", "config.toml"), path.join(CONFIG_DIR, "voltagent.env")],
+    openclaw: [path.join(os.homedir(), ".openclaw", "config.json")]
+  };
+  return (paths[target] || []).map((file) => ({
+    path: file,
+    exists: fs.existsSync(file),
+    mode: fileMode(file)
+  }));
+}
+
+async function keys(command, flags) {
+  const credentials = readCredentials();
+  const grants = Object.entries(credentials)
+    .filter(([key]) => key.startsWith("grant_"))
+    .map(([key, value]) => ({
+      grant_id: key.slice("grant_".length),
+      target: value.target,
+      base_url: value.base_url,
+      credential_store: value.credential_store || "file",
+      key: value.key ? maskSecret(value.key) : "stored"
+    }));
+  if (!command || command === "list") {
+    output({ keys: grants });
+    return;
+  }
+  if (command === "revoke") {
+    const grantId = flags.grant || grants[0]?.grant_id;
+    if (!grantId) throw new Error("grant id is required");
+    const response = await api(`/api/itp/grants/${encodeURIComponent(grantId)}/revoke`, { method: "POST" }, flags);
+    deleteGrantCredential(grantId);
+    output(response);
+    return;
+  }
+  if (command === "rotate") {
+    const grantId = flags.grant || grants[0]?.grant_id;
+    if (!grantId) throw new Error("grant id is required");
+    const existing = readCredentials()[`grant_${grantId}`] || {};
+    const response = await api(`/api/itp/grants/${encodeURIComponent(grantId)}/rotate`, { method: "POST" }, flags);
+    const storedCredential = storeGrantCredential(grantId, {
+      key: response.credential.key_once,
+      target: existing.target || flags.target || "",
+      base_url: response.base_url,
+      openai_base_url: response.openai_base_url,
+      anthropic_base_url: response.anthropic_base_url,
+      gemini_base_url: response.gemini_base_url,
+      models: response.models || [],
+      install_profiles: response.install_profiles || []
+    });
+    output({
+      ...response,
+      credential: {
+        type: response.credential.type,
+        rotated: true,
+        stored: true,
+        credential_store: storedCredential.credential_store,
+        warning: storedCredential.credential_warning || undefined
+      }
+    });
+    return;
+  }
+  throw new Error(`unknown keys command: ${command}`);
+}
+
+async function token(command, flags) {
+  if (command !== "issue") throw new Error(`unknown token command: ${command || ""}`);
+  const grantId = flags.grant || readState().last_grant_id;
+  if (!grantId) throw new Error("grant id is required");
+  const credentials = readGrantCredential(grantId);
+  if (!credentials?.key) throw new Error(`grant ${grantId} is not installed locally`);
+  if (flags.stdout) {
+    process.stdout.write(credentials.key);
+    return;
+  }
+  output({
+    grant_id: grantId,
+    key: maskSecret(credentials.key),
+    stdout_required_for_raw_token: true
+  });
+}
+
+async function sync(flags) {
+  const [account, balanceResult, grants] = await Promise.all([
+    api("/api/itp/account", { method: "GET" }, flags),
+    api("/api/itp/balance", { method: "GET" }, flags),
+    api("/api/itp/grants", { method: "GET" }, flags)
+  ]);
+  output({ account, balance: balanceResult, grants });
+}
+
+async function admin(command, rest, flags) {
+  if (command === "orders") {
+    const params = new URLSearchParams();
+    for (const key of ["account_id", "status", "provider", "limit"]) {
+      if (flags[key]) params.set(key, flags[key]);
+    }
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    output(await api(`/api/itp/admin/orders${suffix}`, { method: "GET" }, flags));
+    return;
+  }
+  if (command === "payment-events") {
+    const params = new URLSearchParams();
+    for (const key of ["order_id", "checkout_id", "out_trade_no", "provider", "event_type", "signature_verified", "limit"]) {
+      if (flags[key]) params.set(key, flags[key]);
+    }
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    output(await api(`/api/itp/admin/payment-events${suffix}`, { method: "GET" }, flags));
+    return;
+  }
+  if (command === "outbox") {
+    const params = new URLSearchParams();
+    for (const key of ["status", "event_type", "aggregate_id", "limit"]) {
+      if (flags[key]) params.set(key, flags[key]);
+    }
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    output(await api(`/api/itp/admin/outbox${suffix}`, { method: "GET" }, flags));
+    return;
+  }
+  if (command === "process-outbox") {
+    output(await api("/api/itp/admin/outbox/process", { method: "POST" }, flags));
+    return;
+  }
+  if (command === "recover-order") {
+    const orderId = rest[0];
+    if (!orderId) throw new Error("order_id is required");
+    output(await api(`/api/itp/admin/orders/${encodeURIComponent(orderId)}/recover`, { method: "POST" }, flags));
+    return;
+  }
+  throw new Error(`unknown admin command: ${command || ""}`);
+}
+
+async function api(pathname, options, flags = {}) {
+  const config = readConfig();
+  const credentials = readCredentials();
+  const base = apiBase(flags, config);
+  const headers = { "Content-Type": "application/json" };
+  if (flags.access_token) {
+    headers.Authorization = String(flags.access_token);
+  } else {
+    const sessionToken = readSessionToken(credentials);
+    if (sessionToken) {
+      headers.Authorization = `Bearer ${sessionToken}`;
+    }
+  }
+  if (flags.new_api_user || flags.new_api_user_id || flags.user_id) {
+    headers["New-Api-User"] = String(flags.new_api_user || flags.new_api_user_id || flags.user_id);
+  }
+  const response = await fetch(`${base}${pathname}`, {
+    method: options.method,
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.success === false) {
+    throw new Error(payload.message || `request failed: ${response.status}`);
+  }
+  return payload.data ?? payload;
+}
+
+function parseFlags(args) {
+  const flags = {};
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (!arg.startsWith("--")) continue;
+    const key = arg.slice(2).replaceAll("-", "_");
+    const next = args[i + 1];
+    if (!next || next.startsWith("--")) {
+      flags[key] = true;
+    } else {
+      flags[key] = next;
+      i += 1;
+    }
+  }
+  return flags;
+}
+
+function apiBase(flags = {}, config = readConfig()) {
+  return (flags.api_base || config.api_base || DEFAULT_API_BASE).replace(/\/$/, "");
+}
+
+function readConfig() {
+  return readJSON(CONFIG_PATH, {});
+}
+
+function writeConfig(value) {
+  writeJSON0600(CONFIG_PATH, value);
+}
+
+function readState() {
+  return readJSON(STATE_PATH, {});
+}
+
+function writeState(value) {
+  writeJSON0600(STATE_PATH, value);
+}
+
+function readCredentials() {
+  return readJSON(CREDENTIALS_PATH, {});
+}
+
+function writeCredentials(value) {
+  writeJSON0600(CREDENTIALS_PATH, value);
+}
+
+function writeJSON0600(file, value) {
+  ensureConfigDir();
+  fs.writeFileSync(file, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+function writeSessionCredentials(response) {
+  const currentAccountId = readConfig().account_id;
+  let credentials = deleteSessionCredential(readCredentials());
+  if (currentAccountId && currentAccountId !== response.account_id) {
+    for (const key of Object.keys(credentials)) {
+      if (key.startsWith("grant_")) {
+        const grantId = key.slice("grant_".length);
+        deleteGrantCredential(grantId);
+      }
+    }
+    credentials = {};
+  }
+  writeCredentials({ ...credentials, ...storeSessionCredential(response) });
+}
+
+function storeSessionCredential(response) {
+  const token = response.session_token;
+  const ref = `voltagent:session:${response.account_id}:${response.device_id}`;
+  const nativeStore = writeNativeSecret(ref, token);
+  if (nativeStore.ok) {
+    return {
+      session_token_store: nativeStore.store,
+      session_token_ref: nativeStore.ref
+    };
+  }
+  return {
+    session_token: token,
+    session_token_store: "file",
+    session_token_warning: nativeStore.error
+  };
+}
+
+function readSessionToken(credentials = readCredentials()) {
+  if (credentials.session_token) {
+    return credentials.session_token;
+  }
+  if (credentials.session_token_store && credentials.session_token_ref) {
+    return readNativeSecret(credentials.session_token_store, credentials.session_token_ref);
+  }
+  return "";
+}
+
+function deleteSessionCredential(credentials) {
+  if (!credentials) {
+    return {};
+  }
+  if (credentials.session_token_store && credentials.session_token_ref) {
+    deleteNativeSecret(credentials.session_token_store, credentials.session_token_ref);
+  }
+  delete credentials.session_token;
+  delete credentials.session_token_store;
+  delete credentials.session_token_ref;
+  delete credentials.session_token_warning;
+  return credentials;
+}
+
+function sanitizeAuthResponse(response) {
+  const { session_token, ...safe } = response;
+  return { ...safe, session_stored: Boolean(session_token) };
+}
+
+function storeGrantCredential(grantId, credential) {
+  const credentials = readCredentials();
+  const key = credential.key;
+  const record = { ...credential };
+  delete record.key;
+  const nativeStore = writeNativeSecret(grantSecretRef(grantId), key);
+  if (nativeStore.ok) {
+    record.credential_store = nativeStore.store;
+    record.credential_ref = nativeStore.ref;
+  } else {
+    record.key = key;
+    record.credential_store = "file";
+    record.credential_warning = nativeStore.error;
+  }
+  credentials[`grant_${grantId}`] = record;
+  writeCredentials(credentials);
+  return record;
+}
+
+function readGrantCredential(grantId) {
+  const record = readCredentials()[`grant_${grantId}`];
+  if (!record) return null;
+  if (record.key) return record;
+  const key = readNativeSecret(record.credential_store, record.credential_ref);
+  return key ? { ...record, key } : record;
+}
+
+function deleteGrantCredential(grantId) {
+  const credentials = readCredentials();
+  const record = credentials[`grant_${grantId}`];
+  if (record?.credential_store && record?.credential_ref) {
+    deleteNativeSecret(record.credential_store, record.credential_ref);
+  }
+  delete credentials[`grant_${grantId}`];
+  writeCredentials(credentials);
+}
+
+function grantSecretRef(grantId) {
+  return `voltagent:${grantId}`;
+}
+
+function detectNativeCredentialStore() {
+  if (process.platform === "darwin" && commandExists("security")) return "macos-keychain";
+  if (process.platform === "linux" && commandExists("secret-tool")) return "secret-tool";
+  return "unavailable";
+}
+
+function writeNativeSecret(ref, secret) {
+  if (!secret) return { ok: false, error: "empty secret" };
+  if (process.platform === "darwin" && commandExists("security")) {
+    try {
+      execFileSync("security", [
+        "add-generic-password",
+        "-a",
+        ref,
+        "-s",
+        "VoltaGent",
+        "-w",
+        secret,
+        "-U"
+      ], { stdio: "ignore" });
+      return { ok: true, store: "macos-keychain", ref };
+    } catch (error) {
+      return { ok: false, error: `macOS Keychain unavailable: ${error.message}` };
+    }
+  }
+  if (process.platform === "linux" && commandExists("secret-tool")) {
+    try {
+      execFileSync("secret-tool", [
+        "store",
+        "--label=VoltaGent",
+        "service",
+        "VoltaGent",
+        "account",
+        ref
+      ], { input: secret, stdio: ["pipe", "ignore", "ignore"] });
+      return { ok: true, store: "secret-tool", ref };
+    } catch (error) {
+      return { ok: false, error: `secret-tool unavailable: ${error.message}` };
+    }
+  }
+  return { ok: false, error: "native credential store unavailable" };
+}
+
+function readNativeSecret(store, ref) {
+  if (!store || !ref) return "";
+  try {
+    if (store === "macos-keychain") {
+      return execFileSync("security", [
+        "find-generic-password",
+        "-a",
+        ref,
+        "-s",
+        "VoltaGent",
+        "-w"
+      ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    }
+    if (store === "secret-tool") {
+      return execFileSync("secret-tool", [
+        "lookup",
+        "service",
+        "VoltaGent",
+        "account",
+        ref
+      ], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function deleteNativeSecret(store, ref) {
+  try {
+    if (store === "macos-keychain") {
+      execFileSync("security", [
+        "delete-generic-password",
+        "-a",
+        ref,
+        "-s",
+        "VoltaGent"
+      ], { stdio: "ignore" });
+    }
+    if (store === "secret-tool") {
+      execFileSync("secret-tool", [
+        "clear",
+        "service",
+        "VoltaGent",
+        "account",
+        ref
+      ], { stdio: "ignore" });
+    }
+  } catch {
+    // The local record is still removed; missing native secrets are harmless.
+  }
+}
+
+function commandExists(command) {
+  try {
+    execFileSync("which", [command], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function ensureConfigDir() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  try {
+    fs.chmodSync(CONFIG_DIR, 0o700);
+  } catch {
+    // Best effort; individual secret files are still written as 0600.
+  }
+}
+
+function readText(file, fallback) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return fallback;
+  }
+}
+
+function readJSON(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJSONWithBackup(file, value, dryRun) {
+  return writeTextWithBackup(file, `${JSON.stringify(value, null, 2)}\n`, 0o600, dryRun);
+}
+
+function writeTextWithBackup(file, content, mode, dryRun) {
+  const backupPath = fs.existsSync(file) ? `${file}.itp-bak-${Date.now()}` : "";
+  if (dryRun) {
+    return { action: fs.existsSync(file) ? "would_update" : "would_create", backup_path: backupPath || null };
+  }
+  const dir = path.dirname(file);
+  if (dir === CONFIG_DIR) {
+    ensureConfigDir();
+  } else {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  if (backupPath) {
+    fs.copyFileSync(file, backupPath);
+    fs.chmodSync(backupPath, mode);
+  }
+  fs.writeFileSync(file, content, { mode });
+  fs.chmodSync(file, mode);
+  return { action: backupPath ? "updated" : "created", backup_path: backupPath || null };
+}
+
+function fileMode(file) {
+  try {
+    return `0${(fs.statSync(file).mode & 0o777).toString(8)}`;
+  } catch {
+    return null;
+  }
+}
+
+function replaceManagedBlock(source, name, block) {
+  const start = `# >>> itp ${name}`;
+  const end = `# <<< itp ${name}`;
+  const managed = `${start}\n${block.trim()}\n${end}`;
+  const pattern = new RegExp(`${escapeRegExp(start)}[\\s\\S]*?${escapeRegExp(end)}`, "m");
+  const trimmed = source.trimEnd();
+  if (pattern.test(source)) return source.replace(pattern, managed);
+  return `${trimmed}${trimmed ? "\n\n" : ""}${managed}\n`;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeTomlString(value) {
+  return String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function currentExecutable() {
+  return process.argv[1] || "itp";
+}
+
+function quoteShell(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function output(value) {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+function outputError(error) {
+  console.error(JSON.stringify({ success: false, message: error.message }, null, 2));
+}
+
+function maskSecret(secret) {
+  if (!secret) return "";
+  if (secret.length <= 8) return "********";
+  return `${secret.slice(0, 4)}********${secret.slice(-4)}`;
+}
+
+function cryptoRandom() {
+	return crypto.randomUUID();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

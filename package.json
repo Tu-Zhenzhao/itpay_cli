@@ -1,0 +1,38 @@
+{
+  "name": "itpay_cli",
+  "version": "0.1.0",
+  "description": "ITPay CLI for buying and installing VoltaGent agent-native model packages.",
+  "type": "module",
+  "bin": {
+    "itp": "./bin/itp",
+    "itpay": "./bin/itp",
+    "itpay_cli": "./bin/itp"
+  },
+  "files": [
+    "bin/",
+    "skills/",
+    "install.sh",
+    "install.ps1",
+    "smoke.sh",
+    "e2e-local.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "smoke": "./smoke.sh",
+    "check": "node --check ./bin/itp && ./smoke.sh"
+  },
+  "keywords": [
+    "itpay",
+    "voltagent",
+    "agent",
+    "cli",
+    "claude-code",
+    "codex",
+    "openclaw"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
