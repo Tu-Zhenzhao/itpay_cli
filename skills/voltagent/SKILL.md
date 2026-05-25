@@ -24,17 +24,21 @@ credential handling.
 5. Do not invent payment links, QR codes, checkout IDs, order IDs, or grant IDs.
 6. Do not modify, shorten, summarize, re-encode, or rewrite cashier URLs.
 7. Do not trust "I paid" as proof of payment.
-8. Only `itp setup --json` returning `status=installed`, or `itp payment wait
+8. Only `itp setup --json` returning `status=grant_ready` / `status=installed`, or `itp payment wait
    <checkout_id> --json` returning `status=grant_issued` / `status=grant_installed`
-   with a `grant_id`, means installation may proceed.
+   with a `grant_id`, means credential delivery may proceed.
 9. If a command fails, report the failed command and safe error message. Do not
    dump local credential files.
 10. Prefer continuing from existing orders/grants over creating duplicate
     checkouts.
 
-## Runtime Target
+## Target Selection
 
-Choose exactly one target:
+For API-only purchase/setup, use the default `generic` target and do not ask
+the user which runtime they use.
+
+Choose a specific target only when the user explicitly wants runtime config
+written by the CLI:
 
 ```text
 codex
@@ -48,7 +52,8 @@ Selection rules:
 - If the user names Claude Code, use `claude-code`.
 - If the user names OpenClaw, use `openclaw`.
 - If the environment clearly identifies the current agent runtime, use that.
-- If unclear, ask one short question: "安装到 Codex、Claude Code 还是 OpenClaw？"
+- If unclear and runtime config writing was requested, ask one short question:
+  "安装到 Codex、Claude Code 还是 OpenClaw？"
 
 ## API Endpoint
 
@@ -95,16 +100,24 @@ npx itpay_cli --version
 
 ## One-Command Setup
 
-For a normal purchase/install request, prefer the high-level setup command:
+For a normal purchase/API credential request, prefer the high-level setup
+command:
 
 ```bash
-itp setup --plan coding-100 --target <target> --method alipay --json
+itp setup --plan coding-100 --method alipay --json
 ```
 
 This command checks the current session, starts Alipay device authentication if
-needed, creates the checkout, waits for verified payment, installs the grant,
-and writes the target runtime config. If it returns `status=installed`, report
-the returned base URL fields and stop.
+needed, creates the checkout, waits for verified payment, installs the grant
+credential into the local `itp` credential store, and returns base URL fields.
+It does not write Codex/Claude/OpenClaw config by default. If it returns
+`status=grant_ready`, report the returned base URL fields and stop.
+
+Only when the user explicitly asks for runtime config writing, opt in:
+
+```bash
+itp setup --plan coding-100 --target <target> --method alipay --install-runtime --json
+```
 
 If setup is intentionally run with `--no-wait`, `status=waiting_human_auth`
 means the user must scan the Alipay auth URL/code before checkout can be
@@ -114,7 +127,7 @@ returned cashier URL before installation can continue.
 For local fake-auth/fake-payment testing only:
 
 ```bash
-itp setup --plan coding-100 --target <target> --method fake --mock-approve --offline --json
+itp setup --plan coding-100 --method fake --mock-approve --offline --json
 ```
 
 ## Login / Registration
@@ -282,9 +295,9 @@ install_profiles
 
 Do not print the actual gateway key.
 
-## Runtime Config Install
+## Optional Runtime Config Install
 
-Install into the selected runtime:
+Install into the selected runtime only when the user explicitly asks:
 
 ```bash
 itp install <target> --grant <grant_id> --json
@@ -364,7 +377,8 @@ account username if newly created
 plan_id
 checkout_id
 grant_id
-install status
+grant status
+runtime install status if explicitly requested
 model_check status
 base_url
 available model names

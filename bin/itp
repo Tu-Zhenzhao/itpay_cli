@@ -157,8 +157,9 @@ async function main() {
           "auth login",
           "auth device start",
           "auth device poll <auth_id>",
-          "setup --plan coding-100 --target codex --method alipay",
-          "setup --plan coding-100 --target codex --method fake --mock-approve",
+          "setup --plan coding-100 --method alipay",
+          "setup --plan coding-100 --target codex --method alipay --install-runtime",
+          "setup --plan coding-100 --method fake --mock-approve",
           "auth status",
           "account show",
           "account login-link",
@@ -204,10 +205,14 @@ async function authRegister(flags) {
 }
 
 async function setup(flags) {
-  const target = flags.target || flags.runtime || "codex";
+  const target = flags.target || flags.runtime || "generic";
   const plan = flags.plan || "coding-100";
   const method = flags.method || "alipay";
   const setupFlags = { ...flags, runtime: target };
+  const shouldInstallRuntime = Boolean(flags.install_runtime || flags.install_config || flags.write_runtime_config) && !flags.no_runtime_install && !flags.no_install;
+  if (shouldInstallRuntime && target === "generic") {
+    throw new Error("--install-runtime requires --target codex, --target claude-code, or --target openclaw");
+  }
   const auth = await ensureAuthenticated(setupFlags);
   if (!auth.authenticated) {
     output(auth);
@@ -244,16 +249,23 @@ async function setup(flags) {
     ? { status: checkout.status, checkout_id: checkout.checkout_id, order_id: checkout.order_id, grant_id: checkout.grant_id }
     : await paymentWaitResult(checkout.checkout_id, setupFlags);
   const grant = await grantsInstallResult(payment.grant_id, { ...setupFlags, target });
-  const runtimeInstall = (flags.no_runtime_install || flags.no_install)
-    ? null
-    : await installRuntimeResult(target, {
+  const runtimeInstall = shouldInstallRuntime
+    ? await installRuntimeResult(target, {
       ...setupFlags,
       grant: payment.grant_id,
       no_test: flags.test ? false : true
-    });
+    })
+    : {
+      status: "skipped",
+      reason: "runtime_config_install_is_opt_in",
+      command: target === "generic"
+        ? `itp install <target> --grant ${payment.grant_id} --json`
+        : `itp install ${target} --grant ${payment.grant_id} --json`
+    };
+  const tokenCommand = `itp token issue --grant ${payment.grant_id} --stdout`;
 
   output({
-    status: "installed",
+    status: shouldInstallRuntime ? "installed" : "grant_ready",
     account_id: auth.account_id,
     device_id: auth.device_id,
     checkout_id: checkout.checkout_id,
@@ -265,11 +277,25 @@ async function setup(flags) {
     openai_base_url: grant.openai_base_url,
     anthropic_base_url: grant.anthropic_base_url,
     gemini_base_url: grant.gemini_base_url,
+    credential: {
+      stored: true,
+      credential_store: grant.credential?.credential_store,
+      warning: grant.credential?.warning,
+      token_command: tokenCommand,
+      stdout_required_for_raw_token: true
+    },
     auth,
     checkout,
     payment,
     grant_install: grant,
-    runtime_install: runtimeInstall
+    runtime_install: runtimeInstall,
+    next_action: shouldInstallRuntime
+      ? null
+      : {
+        type: "configure_agent",
+        token_command: tokenCommand,
+        runtime_install_command: runtimeInstall.command
+      }
   });
 }
 
@@ -641,7 +667,7 @@ async function grantsInstall(grantId, flags) {
 async function grantsInstallResult(grantId, flags) {
   grantId = grantId || readState().last_grant_id;
   if (!grantId) throw new Error("grant_id is required");
-  const target = flags.target || "codex";
+  const target = flags.target || "generic";
   const response = await api(`/api/itp/grants/${encodeURIComponent(grantId)}/install`, {
     method: "POST",
     body: { target }

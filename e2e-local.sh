@@ -53,13 +53,17 @@ curl -fsS "$API_BASE/api/status" >/dev/null
 curl -fsS "$API_BASE/api/itp/plans" | json_assert "return v.success === true && v.data.plans.some(p => p.plan_id === 'coding-100')" >/dev/null
 
 printf 'running one-command setup flow\n' >&2
-SETUP=$(itp_home "$TMP_SETUP_HOME" setup --plan coding-100 --target codex --method fake --mock-approve --offline --json)
-printf '%s' "$SETUP" | json_assert "return v.status === 'installed' && v.grant_id && v.base_url && v.openai_base_url && v.auth && v.auth.session_stored === true"
-test -f "$TMP_SETUP_HOME/.codex/config.toml"
-test -f "$TMP_SETUP_HOME/.itp/voltagent.env"
+SETUP=$(itp_home "$TMP_SETUP_HOME" setup --plan coding-100 --method fake --mock-approve --offline --json)
+printf '%s' "$SETUP" | json_assert "return v.status === 'grant_ready' && v.target === 'generic' && v.grant_id && v.base_url && v.openai_base_url && v.credential && v.credential.stored === true && v.auth && v.auth.session_stored === true && v.runtime_install.status === 'skipped'"
+test ! -f "$TMP_SETUP_HOME/.codex/config.toml"
+TOKEN_FROM_SETUP=$(HOME="$TMP_SETUP_HOME" PATH=/nonexistent VOLTAGENT_API_BASE="$API_BASE" "$NODE" "$ROOT/bin/itp" token issue --grant "$(printf '%s' "$SETUP" | json_get grant_id)" --stdout)
+case "$TOKEN_FROM_SETUP" in
+  sk-*) ;;
+  *) echo "setup token issue did not return sk-* token" >&2; exit 1 ;;
+esac
 
 printf 'checking setup no-wait auth handoff\n' >&2
-SETUP_NOWAIT=$(itp_home "$TMP_SETUP_NOWAIT_HOME" setup --plan coding-100 --target codex --method fake --no-wait --json)
+SETUP_NOWAIT=$(itp_home "$TMP_SETUP_NOWAIT_HOME" setup --plan coding-100 --method fake --no-wait --json)
 printf '%s' "$SETUP_NOWAIT" | json_assert "return v.status === 'waiting_human_auth' && v.action === 'scan_alipay_auth' && v.auth_id && v.user_code && v.verification_uri_complete"
 
 USERNAME="e2e-$(date +%Y%m%d%H%M%S)-$$"

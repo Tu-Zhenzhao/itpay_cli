@@ -14,12 +14,12 @@ It does not contain the closed-source SaaS backend, database files, payment keys
 
 ## What This CLI Does
 
-`itp` lets a developer or coding agent buy and install a VoltaGent model package without manually copying API keys through chat.
+`itp` lets a developer or coding agent buy a VoltaGent model package and receive the gateway base URLs / API credential without manually copying API keys through chat. Runtime config writing is optional.
 
 Main flow:
 
 ```text
-register/login -> list plans -> create checkout -> wait payment -> receive grant -> install runtime config -> check balance/usage
+register/login -> list plans -> create checkout -> wait payment -> receive grant/API credential -> optional runtime config install -> check balance/usage
 ```
 
 Supported runtime targets:
@@ -161,11 +161,21 @@ export VOLTAGENT_API_BASE=https://your-api.example.com
 ```
 
 For the agent-native one-command flow, let the CLI authenticate, create the
-checkout, wait for verified payment, install the grant, and write the runtime
-config:
+checkout, wait for verified payment, and deliver the grant/API credential to
+the local `itp` credential store:
 
 ```bash
-itp setup --plan coding-100 --target codex --method alipay --json
+itp setup --plan coding-100 --method alipay --json
+```
+
+This returns `status=grant_ready` with `base_url`, `openai_base_url`, and the
+local token helper command. It does not write Codex, Claude Code, or OpenClaw
+config by default.
+
+Runtime config writing is opt-in:
+
+```bash
+itp setup --plan coding-100 --target codex --method alipay --install-runtime --json
 ```
 
 With `--no-wait`, setup returns `status=waiting_human_auth` before checkout if
@@ -175,7 +185,7 @@ checkout creation when a payment scan is still required.
 For local fake-auth/fake-payment testing:
 
 ```bash
-itp setup --plan coding-100 --target codex --method fake --mock-approve --offline --json
+itp setup --plan coding-100 --method fake --mock-approve --offline --json
 ```
 
 Manual flow starts with Alipay-bound agent authentication:
@@ -238,7 +248,7 @@ Install the grant credential:
 itp grants install <grant_id> --target codex --json
 ```
 
-Install runtime config:
+Optionally install runtime config:
 
 ```bash
 itp install codex --grant <grant_id> --json
